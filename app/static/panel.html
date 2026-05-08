@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DELTA MTProto Panel</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span>Δ</span><div><b>DELTA</b><small>MTProto Panel</small></div></div>
+    <button class="nav active" data-page="overview">داشبورد</button>
+    <button class="nav" data-page="users">کاربران</button>
+    <button class="nav" data-page="settings">تنظیمات</button>
+    <button class="nav" data-page="logs">لاگ‌ها</button>
+    <form method="post" action="/api/logout"><button class="logout">خروج</button></form>
+  </aside>
+
+  <main class="main">
+    <section id="overview" class="page active">
+      <div class="hero">
+        <div><p class="eyebrow">Overview</p><h1>داشبورد مدیریت پروکسی</h1><p>وضعیت سرور، مصرف منابع و آمار کاربران در یک نگاه.</p></div>
+        <button class="primary" onclick="restartProxy()">ری‌استارت پروکسی</button>
+      </div>
+      <div id="cards" class="cards"></div>
+    </section>
+
+    <section id="users" class="page">
+      <div class="hero slim"><div><p class="eyebrow">Users</p><h1>مدیریت کاربران</h1><p>برای هر کاربر یک پروکسی اختصاصی بساز، حجم و زمانش را تغییر بده.</p></div></div>
+      <div class="layout">
+        <form id="userForm" class="panel-card form-card">
+          <h2>کاربر جدید</h2>
+          <label>نام کاربر</label><input name="name" placeholder="مثلاً Ali" required />
+          <div class="row"><div><label>مدت اعتبار / روز</label><input name="expire_days" type="number" min="0" step="1" placeholder="30" /></div><div><label>حجم / گیگابایت</label><input name="quota_gb" type="number" min="0" step="0.1" value="0" /></div></div>
+          <label>یادداشت</label><textarea name="note" rows="3" placeholder="اختیاری"></textarea>
+          <button class="primary full" type="submit">ساخت پروکسی</button>
+          <p class="muted">عدد 30 یعنی 30 روز از لحظه ساخت. عدد 0 یا خالی یعنی بدون انقضا.</p>
+        </form>
+        <div class="panel-card"><div class="section-head"><h2>لیست کاربران</h2><input id="searchUser" placeholder="جستجو..." /></div><div id="userList" class="user-list"></div></div>
+      </div>
+    </section>
+
+    <section id="settings" class="page">
+      <div class="hero slim"><div><p class="eyebrow">Settings</p><h1>تنظیمات پنل</h1><p>ورود پنل، آدرس سرور برای لینک‌ها و بکاپ/ایمپورت.</p></div></div>
+      <div class="settings-grid">
+        <form id="serverForm" class="panel-card"><h2>سرور و لینک پروکسی</h2><label>دامنه یا IP نمایشی</label><input name="public_host" placeholder="example.com یا 1.2.3.4" /><label>پورت پروکسی‌ها</label><input name="proxy_port_value" type="number" min="1" max="65535" /><button class="primary">ذخیره سرور</button><p class="muted">از این به بعد لینک‌های ساخته‌شده با همین دامنه/IP نمایش داده می‌شوند.</p></form>
+        <form id="adminForm" class="panel-card"><h2>ورود به پنل</h2><label>نام کاربری</label><input name="username" required /><label>رمز جدید</label><input name="password" type="password" placeholder="خالی بماند یعنی تغییر نکند" /><button class="primary">ذخیره ورود</button></form>
+        <div class="panel-card backup-card"><h2>بکاپ</h2><p class="muted">بکاپ شامل تمام کاربران، Secretها، حجم، تاریخ و تنظیمات اصلی است.</p><a class="button primary" href="/api/backup/export">دانلود بکاپ</a><form id="importForm"><label>ایمپورت بکاپ</label><input name="backup" type="file" accept="application/json,.json" required /><button class="ghost">ایمپورت و جایگزینی</button></form></div>
+      </div>
+    </section>
+
+    <section id="logs" class="page">
+      <div class="hero slim"><div><p class="eyebrow">Logs</p><h1>لاگ‌های سرویس</h1></div><button onclick="loadLogs()">رفرش</button></div>
+      <pre id="logBox" class="logs"></pre>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
