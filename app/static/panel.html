@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DELTA MTProto Panel</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span>Δ</span><div><b>DELTA</b><small>MTProto Panel</small></div></div>
+    <button class="nav active" data-page="overview">Overview</button>
+    <button class="nav" data-page="users">Users</button>
+    <button class="nav" data-page="settings">Settings</button>
+    <button class="nav" data-page="logs">Logs</button>
+    <form method="post" action="/api/logout"><button class="logout">خروج</button></form>
+  </aside>
+
+  <main class="main">
+    <section id="overview" class="page active">
+      <div class="topbar">
+        <div><p class="kicker">OVERVIEW</p><h1>داشبورد سرور</h1><p>وضعیت سرور، پورت مشترک، کاربران و ترافیک کلی</p></div>
+        <div class="top-actions"><button onclick="loadOverview()">رفرش</button><button class="primary" onclick="restartProxy()">ری‌استارت</button></div>
+      </div>
+      <div id="cards" class="cards"></div>
+    </section>
+
+    <section id="users" class="page">
+      <div class="topbar compact">
+        <div><p class="kicker">USERS</p><h1>مدیریت کاربران</h1><p>ساخت، ویرایش حجم و تاریخ، فعال/غیرفعال و کپی لینک پروکسی</p></div>
+        <div class="top-actions"><input id="searchUser" class="search" placeholder="جستجوی کاربر..." /><button class="primary" onclick="openCreateModal()">+ ساخت یوزر</button></div>
+      </div>
+      <div class="notice">در حالت Shared Port همه کاربران روی یک پورت هستند. حجم هر کاربر به‌صورت سهمیه و مصرف ثبت‌شده نمایش داده می‌شود؛ ترافیک واقعی کل پورت در Overview دیده می‌شود.</div>
+      <div id="userList" class="user-list table-like"></div>
+    </section>
+
+    <section id="settings" class="page">
+      <div class="topbar compact"><div><p class="kicker">SETTINGS</p><h1>تنظیمات</h1><p>آدرس لینک‌ها، تم، ورود پنل، بکاپ و تلگرام</p></div></div>
+      <div class="settings-grid">
+        <form id="serverForm" class="panel-card"><h2>سرور و ظاهر</h2><label>دامنه یا IP نمایشی</label><input name="public_host" placeholder="example.com یا 1.2.3.4" /><label>پورت مشترک</label><input name="proxy_port_value" type="number" min="1" max="65535" /><label>تم پنل</label><select name="theme"><option value="dark">دارک</option><option value="light">لایت</option></select><button class="primary">ذخیره</button></form>
+        <form id="adminForm" class="panel-card"><h2>ورود به پنل</h2><label>نام کاربری</label><input name="username" required /><label>رمز جدید</label><input name="password" type="password" placeholder="خالی بماند یعنی تغییر نکند" /><button class="primary">ذخیره ورود</button></form>
+        <form id="telegramForm" class="panel-card"><h2>API بات تلگرام</h2><label>Bot Token</label><input name="telegram_bot_token" dir="ltr" placeholder="123456:ABC..." /><label>Chat ID</label><input name="telegram_chat_id" dir="ltr" placeholder="123456789" /><div class="button-row"><button class="primary">ذخیره بات</button><button type="button" class="ghost" onclick="testTelegram()">تست</button></div></form>
+        <div class="panel-card"><h2>بکاپ</h2><p class="muted">بکاپ شامل کاربران، secretها، حجم، تاریخ و تنظیمات است.</p><a class="button primary" href="/api/backup/export">دانلود بکاپ</a><form id="importForm" class="backup-form"><label>ایمپورت بکاپ</label><input name="backup" type="file" accept="application/json,.json" required /><button class="ghost">ایمپورت</button></form></div>
+      </div>
+    </section>
+
+    <section id="logs" class="page">
+      <div class="topbar compact"><div><p class="kicker">LOGS</p><h1>لاگ‌ها</h1></div><button onclick="loadLogs()">رفرش</button></div>
+      <pre id="logBox" class="logs"></pre>
+    </section>
+  </main>
+
+  <div id="userModal" class="modal" aria-hidden="true">
+    <div class="modal-backdrop" onclick="closeUserModal()"></div>
+    <div class="modal-card">
+      <div class="modal-head"><div><p class="kicker" id="modalKicker">CREATE</p><h2 id="modalTitle">ساخت یوزر</h2></div><button class="icon-btn" onclick="closeUserModal()">×</button></div>
+      <form id="userForm">
+        <input type="hidden" name="uid" />
+        <label>نام کاربر</label><input name="name" placeholder="مثلاً Ali" required />
+        <div class="row"><div><label>اعتبار از امروز / روز</label><input name="expire_days" type="number" min="0" step="1" placeholder="30" /></div><div><label>حجم</label><div class="unit-input"><input name="quota_value" type="number" min="0" step="0.01" value="30" /><select name="quota_unit"><option value="GB">GB</option><option value="MB">MB</option></select></div></div></div>
+        <label id="keepExpireLabel" class="check hidden"><input name="keep_expire" type="checkbox" value="1" checked /> اگر روز جدید خالی بود تاریخ فعلی حفظ شود</label>
+        <div id="usedBox" class="hidden"><label>مصرف ثبت‌شده</label><div class="unit-input"><input name="used_value" type="number" min="0" step="0.01" value="0" /><select name="used_unit"><option value="GB">GB</option><option value="MB">MB</option></select></div></div>
+        <label id="enabledBox" class="hidden">وضعیت</label><select name="enabled" class="hidden"><option value="1">فعال</option><option value="0">غیرفعال</option></select>
+        <label>یادداشت</label><textarea name="note" rows="3" placeholder="اختیاری"></textarea>
+        <div class="button-row"><button class="primary" type="submit" id="modalSubmit">ساخت یوزر</button><button class="ghost" type="button" onclick="closeUserModal()">لغو</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
