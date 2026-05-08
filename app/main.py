@@ -1,0 +1,964 @@
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import psutil
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+APP_DIR = Path(os.getenv("APP_DIR", "/opt/delta-proxy-panel"))
+DB_PATH = Path(os.getenv("DB_PATH", str(APP_DIR / "delta.db")))
+ENV_PUBLIC_HOST = os.getenv("PUBLIC_HOST", "")
+ENV_PROXY_PORT = int(os.getenv("PROXY_PORT", "443"))
+SPONSOR_TAG = os.getenv("SPONSOR_TAG", "").strip()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = base64.b64decode(os.getenv("ADMIN_PASSWORD_B64", "").encode() or b"").decode(errors="ignore")
+SECRET_KEY = hashlib.sha256((ADMIN_USERNAME + ADMIN_PASSWORD + str(APP_DIR)).encode()).hexdigest()
+STATIC_DIR = Path(__file__).parent / "static"
+
+app = FastAPI(title="DELTA MTProto Panel")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def db() -> sqlite3.Connection:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def pass_hash(password: str) -> str:
+    return hashlib.sha256(("delta:" + password).encode()).hexdigest()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def setting(key: str, default: str = "") -> str:
+    with db() as conn:
+        row = conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
+    return row["v"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO settings(k,v) VALUES (?,?)", (key, value))
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                secret TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                expire_at TEXT,
+                quota_gb REAL DEFAULT 0,
+                used_gb REAL DEFAULT 0,
+                note TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_states (
+                chat_id TEXT PRIMARY KEY,
+                state TEXT,
+                payload TEXT,
+                updated_at TEXT
+            )
+        """)
+        ensure_column(conn, "users", "port", "port INTEGER")
+        ensure_column(conn, "users", "rx_bytes", "rx_bytes INTEGER DEFAULT 0")
+        ensure_column(conn, "users", "tx_bytes", "tx_bytes INTEGER DEFAULT 0")
+        ensure_column(conn, "users", "last_seen", "last_seen TEXT")
+        ensure_column(conn, "users", "disabled_reason", "disabled_reason TEXT")
+        existing_admin = conn.execute('SELECT v FROM settings WHERE k="admin_username"').fetchone()
+        if not existing_admin:
+            set_setting(conn, "admin_username", ADMIN_USERNAME)
+            set_setting(conn, "admin_hash", pass_hash(ADMIN_PASSWORD))
+        defaults = {
+            "public_host": ENV_PUBLIC_HOST,
+            "proxy_port": str(ENV_PROXY_PORT),
+            "panel_title": "DELTA MTProto",
+            "theme": "dark",
+            "telegram_bot_token": "",
+            "telegram_chat_id": "",
+            "telegram_bot_enabled": "1",
+            "telegram_update_offset": "0",
+        }
+        for k, v in defaults.items():
+            if not conn.execute("SELECT 1 FROM settings WHERE k=?", (k,)).fetchone():
+                set_setting(conn, k, v)
+        # migrate old users without a dedicated port
+        base = int(setting("proxy_port", str(ENV_PROXY_PORT)) or ENV_PROXY_PORT)
+        rows = conn.execute("SELECT id FROM users WHERE port IS NULL OR port=0 ORDER BY id ASC").fetchall()
+        for i, r in enumerate(rows):
+            conn.execute("UPDATE users SET port=? WHERE id=?", (next_free_port(conn, base + i, exclude_id=r["id"]), r["id"]))
+        conn.commit()
+
+
+def is_authed(req: Request) -> bool:
+    token = req.cookies.get("delta_session", "")
+    good = hmac.new(SECRET_KEY.encode(), b"login", hashlib.sha256).hexdigest()
+    return hmac.compare_digest(token, good)
+
+
+def require(req: Request) -> None:
+    if not is_authed(req):
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def parse_expire_days(days: Optional[str], current: Optional[str] = None, keep_when_blank: bool = False) -> Optional[str]:
+    if days is None or str(days).strip() == "":
+        return current if keep_when_blank else None
+    try:
+        d = int(float(str(days).strip()))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="expire_days must be a number")
+    if d <= 0:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(days=d)).isoformat()
+
+
+def days_left(expire_at: Optional[str]) -> Optional[int]:
+    if not expire_at:
+        return None
+    try:
+        end = datetime.fromisoformat(expire_at.replace("Z", "+00:00"))
+        diff = end - datetime.now(timezone.utc)
+        return max(0, diff.days + (1 if diff.seconds else 0))
+    except Exception:
+        return None
+
+
+def is_not_expired(expire_at: Optional[str]) -> bool:
+    if not expire_at:
+        return True
+    try:
+        return datetime.fromisoformat(expire_at.replace("Z", "+00:00")) > datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+
+def proxy_host() -> str:
+    return setting("public_host", ENV_PUBLIC_HOST) or ENV_PUBLIC_HOST
+
+
+def base_proxy_port() -> int:
+    try:
+        return int(setting("proxy_port", str(ENV_PROXY_PORT)))
+    except Exception:
+        return ENV_PROXY_PORT
+
+
+def proxy_link(secret: str, port: int | None = None) -> str:
+    # Shared Port mode: all users connect to one public port; user identity is the secret.
+    return f"tg://proxy?server={proxy_host()}&port={base_proxy_port()}&secret={secret}"
+
+
+def next_free_port(conn: sqlite3.Connection, start: int, exclude_id: Optional[int] = None) -> int:
+    used = {int(r["port"]) for r in conn.execute("SELECT port FROM users WHERE port IS NOT NULL AND port>0").fetchall()}
+    if exclude_id:
+        row = conn.execute("SELECT port FROM users WHERE id=?", (exclude_id,)).fetchone()
+        if row and row["port"]:
+            used.discard(int(row["port"]))
+    port = max(1, min(65535, int(start)))
+    while port in used and port < 65535:
+        port += 1
+    if port > 65535:
+        raise HTTPException(status_code=400, detail="no free port")
+    return port
+
+
+def active_users() -> list[sqlite3.Row]:
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM users WHERE enabled=1 ORDER BY id ASC").fetchall()
+    return [row for row in rows if is_not_expired(row["expire_at"])]
+
+
+
+def create_user_core(name: str, expire_days: str = "", quota_gb: float = 0, note: str = "") -> dict:
+    """Create a user/proxy from both web panel and Telegram bot."""
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("name is required")
+    quota = float(quota_gb or 0)
+    if quota < 0:
+        raise ValueError("quota must be positive")
+    expire_at = parse_expire_days(expire_days or "")
+    secret = secrets.token_hex(16)
+    port = base_proxy_port()  # v4+ shared-port mode: all users use one public port
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO users(name, secret, enabled, expire_at, quota_gb, used_gb, port, rx_bytes, tx_bytes, last_seen, disabled_reason, note, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (clean_name, secret, 1, expire_at, quota, 0, port, 0, 0, None, None, note or "", now_iso()),
+        )
+        conn.commit()
+        uid = int(cur.lastrowid)
+    render_proxy_service()
+    return {"id": uid, "name": clean_name, "secret": secret, "enabled": 1, "expire_at": expire_at, "quota_gb": quota, "used_gb": 0, "port": port, "link": proxy_link(secret, port)}
+
+
+def update_user_core(uid: int, name: Optional[str] = None, expire_days: Optional[str] = None, quota_gb: Optional[float] = None,
+                     used_gb: Optional[float] = None, enabled: Optional[int] = None, note: Optional[str] = None) -> None:
+    """Update a user/proxy from both web panel and Telegram bot."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not row:
+            raise ValueError("user not found")
+        updates = []
+        values = []
+        if name is not None:
+            clean_name = str(name).strip()
+            if not clean_name:
+                raise ValueError("name is required")
+            updates.append("name=?"); values.append(clean_name)
+        if expire_days is not None:
+            updates.append("expire_at=?"); values.append(parse_expire_days(expire_days or ""))
+        if quota_gb is not None:
+            q = float(quota_gb or 0)
+            if q < 0:
+                raise ValueError("quota must be positive")
+            updates.append("quota_gb=?"); values.append(q)
+        if used_gb is not None:
+            u = float(used_gb or 0)
+            if u < 0:
+                raise ValueError("used must be positive")
+            updates.append("used_gb=?"); values.append(u)
+        if enabled is not None:
+            updates.append("enabled=?"); values.append(1 if int(enabled) else 0)
+            if int(enabled):
+                updates.append("disabled_reason=?"); values.append(None)
+        if note is not None:
+            updates.append("note=?"); values.append(note)
+        if updates:
+            values.append(uid)
+            conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id=?", values)
+            conn.commit()
+    render_proxy_service()
+
+def svc_name(uid: int) -> str:
+    return f"mtpulse-u{uid}"
+
+
+def render_proxy_service() -> None:
+    users = active_users()
+    service_dir = Path("/etc/systemd/system")
+    service_dir.mkdir(parents=True, exist_ok=True)
+
+    # V4 Shared Port mode: one MTProxy instance, one public port, multiple -S secrets.
+    # This keeps all users on the same port. Per-user traffic cannot be exact unless
+    # MTProxy is patched/logged by secret; traffic below is total shared-port traffic.
+    for service in service_dir.glob("mtpulse-u*.service"):
+        subprocess.run(["systemctl", "disable", "--now", service.stem], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        try:
+            service.unlink()
+        except Exception:
+            pass
+
+    shared = service_dir / "mtpulse-shared.service"
+    if not users:
+        subprocess.run(["systemctl", "disable", "--now", "mtpulse-shared"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        try:
+            shared.unlink()
+        except Exception:
+            pass
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+        return
+
+    secrets_args = " ".join(f"-S {u['secret']}" for u in users)
+    p_arg = f" -P {SPONSOR_TAG}" if SPONSOR_TAG else ""
+    exec_start = (
+        f"/usr/local/bin/mtproto-proxy -u nobody -p 8800 -H {base_proxy_port()} "
+        f"{secrets_args}{p_arg} --aes-pwd /etc/mtpulse/proxy-secret /etc/mtpulse/proxy-multi.conf -M 1"
+    )
+    shared.write_text(f"""[Unit]
+Description=DELTA MTProto shared-port service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exec_start}
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+""")
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "mtpulse-shared"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    subprocess.run(["systemctl", "restart", "mtpulse-shared"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    ensure_traffic_rules()
+
+
+def run(cmd: list[str]) -> str:
+    return subprocess.run(cmd, text=True, capture_output=True, check=False).stdout
+
+
+def ensure_traffic_rules() -> None:
+    if os.geteuid() != 0:
+        return
+    port = base_proxy_port()
+    subprocess.run(["iptables", "-N", "DELTA_MTPROTO_TRAFFIC"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if subprocess.run(["iptables", "-C", "INPUT", "-j", "DELTA_MTPROTO_TRAFFIC"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode != 0:
+        subprocess.run(["iptables", "-I", "INPUT", "1", "-j", "DELTA_MTPROTO_TRAFFIC"], check=False)
+    if subprocess.run(["iptables", "-C", "OUTPUT", "-j", "DELTA_MTPROTO_TRAFFIC"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode != 0:
+        subprocess.run(["iptables", "-I", "OUTPUT", "1", "-j", "DELTA_MTPROTO_TRAFFIC"], check=False)
+    existing = run(["iptables", "-S", "DELTA_MTPROTO_TRAFFIC"])
+    cin = f"delta-shared-in-{port}"
+    cout = f"delta-shared-out-{port}"
+    if cin not in existing:
+        subprocess.run(["iptables", "-A", "DELTA_MTPROTO_TRAFFIC", "-p", "tcp", "--dport", str(port), "-m", "comment", "--comment", cin, "-j", "RETURN"], check=False)
+    if cout not in existing:
+        subprocess.run(["iptables", "-A", "DELTA_MTPROTO_TRAFFIC", "-p", "tcp", "--sport", str(port), "-m", "comment", "--comment", cout, "-j", "RETURN"], check=False)
+
+
+def parse_iptables_counters() -> dict[int, dict[str, int]]:
+    ensure_traffic_rules()
+    port = base_proxy_port()
+    out = run(["iptables", "-L", "DELTA_MTPROTO_TRAFFIC", "-v", "-x", "-n"])
+    data: dict[int, dict[str, int]] = {port: {"rx": 0, "tx": 0}}
+    for line in out.splitlines():
+        m_in = re.search(r"^\s*\d+\s+(\d+).*dpt:(\d+).*delta-shared-in-(\d+)", line)
+        m_out = re.search(r"^\s*\d+\s+(\d+).*spt:(\d+).*delta-shared-out-(\d+)", line)
+        if m_in:
+            data[port]["rx"] = int(m_in.group(1))
+        if m_out:
+            data[port]["tx"] = int(m_out.group(1))
+    return data
+
+
+def online_by_port() -> dict[int, int]:
+    out = run(["ss", "-Htan", "state", "established"])
+    counts: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[3]
+        try:
+            port = int(local.rsplit(":", 1)[-1])
+            counts[port] = counts.get(port, 0) + 1
+        except Exception:
+            pass
+    return counts
+
+
+def sync_traffic() -> None:
+    counters = parse_iptables_counters()
+    online = online_by_port()
+    shared_port = base_proxy_port()
+    c = counters.get(shared_port, {"rx": 0, "tx": 0})
+    total_gb = (int(c["rx"]) + int(c["tx"])) / (1024**3)
+    last_seen = now_iso() if online.get(shared_port, 0) else None
+    # Shared-port mode cannot attribute exact traffic per secret. Keep per-user traffic editable
+    # and expose shared traffic separately in overview/users as approximate telemetry.
+    with db() as conn:
+        rows = conn.execute("SELECT id,quota_gb,used_gb,enabled FROM users").fetchall()
+        active_count = max(1, len([r for r in rows if int(r['enabled'])]))
+        approximate_each = total_gb / active_count
+        for r in rows:
+            if last_seen and int(r["enabled"]):
+                conn.execute("UPDATE users SET last_seen=COALESCE(?, last_seen) WHERE id=?", (last_seen, r["id"]))
+            if r["quota_gb"] and float(r["used_gb"] or 0) >= float(r["quota_gb"]) and int(r["enabled"]):
+                conn.execute("UPDATE users SET enabled=0, disabled_reason='quota' WHERE id=?", (r["id"],))
+        set_setting(conn, "shared_rx_bytes", str(c["rx"]))
+        set_setting(conn, "shared_tx_bytes", str(c["tx"]))
+        set_setting(conn, "shared_approx_gb_each", str(approximate_each))
+        conn.commit()
+
+
+def telegram_send(text: str) -> dict:
+    chat_id = setting("telegram_chat_id", "").strip()
+    if not chat_id:
+        return {"ok": False, "error": "chat id is empty"}
+    return telegram_send_to(chat_id, text)
+
+
+def fmt_gb(v) -> str:
+    try:
+        n = float(v or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return "نامحدود"
+    if n < 1:
+        return f"{n * 1024:.0f} MB"
+    return f"{n:.2f}".rstrip("0").rstrip(".") + " GB"
+
+
+def bot_token() -> str:
+    return setting("telegram_bot_token", "").strip()
+
+
+def bot_allowed_chat() -> str:
+    return setting("telegram_chat_id", "").strip()
+
+
+def telegram_api(method: str, data: dict | None = None) -> dict:
+    token = bot_token()
+    if not token:
+        return {"ok": False, "error": "bot token is empty"}
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        payload = urllib.parse.urlencode(data or {}).encode() if data is not None else None
+        with urllib.request.urlopen(url, data=payload, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+
+def tg_markup(buttons: list[list[tuple[str, str]]]) -> str:
+    return json.dumps({"inline_keyboard": [[{"text": t, "callback_data": c} for t, c in row] for row in buttons]}, ensure_ascii=False)
+
+
+def telegram_send_to(chat_id: str, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> dict:
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "false"}
+    if buttons:
+        payload["reply_markup"] = tg_markup(buttons)
+    return telegram_api("sendMessage", payload)
+
+
+def telegram_edit(chat_id: str, message_id: int, text: str, buttons: list[list[tuple[str, str]]] | None = None) -> dict:
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "false"}
+    if buttons:
+        payload["reply_markup"] = tg_markup(buttons)
+    return telegram_api("editMessageText", payload)
+
+
+def telegram_answer_callback(callback_id: str, text: str = "") -> dict:
+    return telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+
+
+def set_bot_state(chat_id: str, state: str, payload: dict | None = None) -> None:
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO bot_states(chat_id,state,payload,updated_at) VALUES (?,?,?,?)", (chat_id, state, json.dumps(payload or {}, ensure_ascii=False), now_iso()))
+        conn.commit()
+
+
+def get_bot_state(chat_id: str) -> tuple[str, dict]:
+    with db() as conn:
+        row = conn.execute("SELECT state,payload FROM bot_states WHERE chat_id=?", (chat_id,)).fetchone()
+    if not row:
+        return "", {}
+    try:
+        return row["state"] or "", json.loads(row["payload"] or "{}")
+    except Exception:
+        return row["state"] or "", {}
+
+
+def clear_bot_state(chat_id: str) -> None:
+    with db() as conn:
+        conn.execute("DELETE FROM bot_states WHERE chat_id=?", (chat_id,))
+        conn.commit()
+
+
+def main_menu_text() -> str:
+    return "🤖 <b>DELTA MTProto Bot</b>\nاز دکمه‌های زیر پنل را مدیریت کن."
+
+
+def main_menu_buttons() -> list[list[tuple[str, str]]]:
+    return [
+        [("➕ ساخت کاربر", "new:start"), ("👥 لیست پروکسی‌ها", "users:1")],
+        [("📊 وضعیت سرور", "overview"), ("⚙️ تنظیمات", "settings")],
+        [("📦 بکاپ", "backup"), ("🔄 ری‌استارت پروکسی", "restart")],
+    ]
+
+
+def settings_buttons() -> list[list[tuple[str, str]]]:
+    return [
+        [("🌐 سرور / دامنه", "settings:server"), ("🔐 ادمین پنل", "settings:admin")],
+        [("🎨 تم سایت", "settings:theme"), ("🤖 تنظیمات ربات", "settings:bot")],
+        [("📥 ایمپورت بکاپ", "settings:import"), ("⬅️ بازگشت", "menu")],
+    ]
+
+
+def user_detail_text(r: sqlite3.Row | dict) -> str:
+    d = dict(r)
+    used = float(d.get("used_gb") or 0); quota = float(d.get("quota_gb") or 0)
+    remain = "نامحدود" if quota <= 0 else fmt_gb(max(0, quota - used))
+    return (
+        f"👤 <b>{d['name']}</b>  <code>#{d['id']}</code>\n"
+        f"وضعیت: {'✅ فعال' if int(d.get('enabled') or 0) and is_not_expired(d.get('expire_at')) else '⛔️ غیرفعال'}\n"
+        f"حجم کل: {fmt_gb(quota)}\n"
+        f"مصرف شده: {fmt_gb(used)}\n"
+        f"باقی‌مانده: {remain}\n"
+        f"روزهای باقی‌مانده: {days_left(d.get('expire_at')) if d.get('expire_at') else '∞'}\n"
+        f"پورت مشترک: <code>{base_proxy_port()}</code>\n\n"
+        f"🔗 {proxy_link(d['secret'])}"
+    )
+
+
+def user_detail_buttons(uid: int) -> list[list[tuple[str, str]]]:
+    return [
+        [("➕ افزایش تاریخ", f"u:{uid}:days"), ("📦 تغییر حجم", f"u:{uid}:quota")],
+        [("✏️ تغییر اسم", f"u:{uid}:name"), ("♻️ ریست مصرف", f"u:{uid}:reset")],
+        [("✅/⛔️ فعال/غیرفعال", f"u:{uid}:toggle"), ("🗑 حذف", f"u:{uid}:delask")],
+        [("⬅️ لیست", "users:1"), ("🏠 منو", "menu")],
+    ]
+
+
+def bot_overview_text() -> str:
+    sync_traffic()
+    mem = psutil.virtual_memory(); disk = psutil.disk_usage("/"); online = online_by_port().get(base_proxy_port(), 0)
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        enabled = conn.execute("SELECT COUNT(*) n FROM users WHERE enabled=1").fetchone()["n"]
+    return f"📊 <b>وضعیت سرور</b>\nCPU: {psutil.cpu_percent(interval=0.1)}%\nRAM: {mem.percent}%\nDisk: {disk.percent}%\nUsers: {enabled}/{total}\nOnline: {online}\nHost: <code>{proxy_host()}</code>\nPort: <code>{base_proxy_port()}</code>"
+
+
+def ask(chat_id: str, state: str, text: str, payload: dict | None = None) -> None:
+    set_bot_state(chat_id, state, payload or {})
+    telegram_send_to(chat_id, text, [[("لغو", "cancel")]])
+
+
+def handle_bot_text_state(chat_id: str, text: str) -> bool:
+    state, payload = get_bot_state(chat_id)
+    if not state:
+        return False
+    try:
+        if state == "new_days":
+            days = int(float(text));
+            if days <= 0: raise ValueError()
+            payload["days"] = days
+            set_bot_state(chat_id, "new_unit", payload)
+            telegram_send_to(chat_id, "حجم را با چه واحدی وارد می‌کنی؟", [[("GB", "new:unit:gb"), ("MB", "new:unit:mb")], [("لغو", "cancel")]])
+            return True
+        if state == "new_unit":
+            t = text.strip().lower()
+            if t not in {"gb", "g", "گیگ", "mb", "m", "مگ"}:
+                raise ValueError("unit")
+            payload["unit"] = "gb" if t in {"gb", "g", "گیگ"} else "mb"
+            set_bot_state(chat_id, "new_volume", payload)
+            telegram_send_to(chat_id, f"حجم را وارد کن ({payload['unit'].upper()}):", [[("لغو", "cancel")]])
+            return True
+        if state == "new_volume":
+            vol = float(text.replace(",", "."));
+            if vol < 0: raise ValueError()
+            unit = payload.get("unit", "gb")
+            payload["quota_gb"] = vol if unit == "gb" else vol / 1024
+            set_bot_state(chat_id, "new_name", payload)
+            telegram_send_to(chat_id, "اسم کاربر را وارد کن:", [[("لغو", "cancel")]])
+            return True
+        if state == "new_name":
+            name = text.strip()
+            if not name: raise ValueError("name")
+            u = create_user_core(name, str(payload.get("days", "")), float(payload.get("quota_gb") or 0), "created by button bot")
+            clear_bot_state(chat_id)
+            telegram_send_to(chat_id, f"✅ پروکسی ساخته شد\n\n" + user_detail_text({"id": u["id"], "name": u["name"], "secret": u["secret"], "enabled": 1, "expire_at": u["expire_at"], "quota_gb": u["quota_gb"], "used_gb": 0}), main_menu_buttons())
+            return True
+        if state.startswith("edit:"):
+            uid = int(payload["uid"]); field = payload["field"]
+            if field == "days":
+                days = int(float(text)); update_user_core(uid, expire_days=str(days))
+            elif field == "quota":
+                val = float(text.replace(",", ".")); unit = payload.get("unit", "gb"); update_user_core(uid, quota_gb=(val if unit == "gb" else val/1024))
+            elif field == "name":
+                update_user_core(uid, name=text.strip())
+            elif field == "used":
+                update_user_core(uid, used_gb=float(text.replace(",", ".")))
+            clear_bot_state(chat_id)
+            with db() as conn: r = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            telegram_send_to(chat_id, "✅ تغییرات ذخیره شد.\n\n" + user_detail_text(r), user_detail_buttons(uid))
+            return True
+        if state == "set_server_host":
+            with db() as conn: set_setting(conn, "public_host", text.strip()); conn.commit()
+            clear_bot_state(chat_id); render_proxy_service()
+            telegram_send_to(chat_id, "✅ دامنه/IP ذخیره شد.", settings_buttons()); return True
+        if state == "set_server_port":
+            port = int(text); assert 1 <= port <= 65535
+            with db() as conn: set_setting(conn, "proxy_port", str(port)); conn.commit()
+            clear_bot_state(chat_id); render_proxy_service()
+            telegram_send_to(chat_id, "✅ پورت مشترک ذخیره شد.", settings_buttons()); return True
+        if state == "set_admin_user":
+            with db() as conn: set_setting(conn, "admin_username", text.strip()); conn.commit()
+            clear_bot_state(chat_id); telegram_send_to(chat_id, "✅ نام کاربری پنل تغییر کرد.", settings_buttons()); return True
+        if state == "set_admin_pass":
+            with db() as conn: set_setting(conn, "admin_hash", pass_hash(text.strip())); conn.commit()
+            clear_bot_state(chat_id); telegram_send_to(chat_id, "✅ رمز پنل تغییر کرد.", settings_buttons()); return True
+        if state == "set_bot_token":
+            with db() as conn: set_setting(conn, "telegram_bot_token", text.strip()); conn.commit()
+            clear_bot_state(chat_id); telegram_send_to(chat_id, "✅ توکن ربات ذخیره شد.", settings_buttons()); return True
+        if state == "set_bot_chat":
+            with db() as conn: set_setting(conn, "telegram_chat_id", text.strip()); conn.commit()
+            clear_bot_state(chat_id); telegram_send_to(chat_id, "✅ Chat ID ذخیره شد.", settings_buttons()); return True
+        if state == "import_backup":
+            data = json.loads(text)
+            users_data = data.get("users", []); settings_data = data.get("settings", {})
+            with db() as conn:
+                for k, v in settings_data.items():
+                    if k in {"public_host", "proxy_port", "panel_title", "admin_username", "admin_hash", "theme", "telegram_bot_token", "telegram_chat_id", "telegram_bot_enabled"}: set_setting(conn, k, str(v))
+                conn.execute("DELETE FROM users")
+                for u in users_data:
+                    conn.execute("INSERT INTO users(name, secret, enabled, expire_at, quota_gb, used_gb, port, rx_bytes, tx_bytes, last_seen, disabled_reason, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (u.get("name", "user"), u.get("secret") or secrets.token_hex(16), int(u.get("enabled", 1)), u.get("expire_at"), float(u.get("quota_gb") or 0), float(u.get("used_gb") or 0), base_proxy_port(), int(u.get("rx_bytes") or 0), int(u.get("tx_bytes") or 0), u.get("last_seen"), u.get("disabled_reason"), u.get("note", ""), u.get("created_at") or now_iso()))
+                conn.commit()
+            clear_bot_state(chat_id); render_proxy_service(); telegram_send_to(chat_id, f"✅ بکاپ ایمپورت شد. تعداد کاربران: {len(users_data)}", settings_buttons()); return True
+    except Exception:
+        telegram_send_to(chat_id, "❌ مقدار وارد شده درست نیست. دوباره وارد کن یا لغو را بزن.", [[("لغو", "cancel")]])
+        return True
+    return False
+
+
+def handle_bot_callback(callback: dict) -> None:
+    callback_id = callback.get("id", "")
+    data = callback.get("data", "")
+    msg = callback.get("message", {})
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    message_id = int(msg.get("message_id", 0) or 0)
+    allowed = bot_allowed_chat()
+    if allowed and chat_id != allowed:
+        telegram_answer_callback(callback_id, "غیرمجاز")
+        return
+    telegram_answer_callback(callback_id)
+    try:
+        if data == "cancel":
+            clear_bot_state(chat_id); telegram_edit(chat_id, message_id, main_menu_text(), main_menu_buttons()); return
+        if data == "menu":
+            clear_bot_state(chat_id); telegram_edit(chat_id, message_id, main_menu_text(), main_menu_buttons()); return
+        if data == "new:start":
+            clear_bot_state(chat_id); ask(chat_id, "new_days", "چند روز اعتبار داشته باشد؟\nمثلاً: <code>30</code>"); return
+        if data.startswith("new:unit:"):
+            state,payload=get_bot_state(chat_id); payload["unit"] = data.rsplit(":",1)[-1]
+            ask(chat_id, "new_volume", f"حجم را وارد کن ({payload['unit'].upper()}):", payload); return
+        if data == "overview":
+            telegram_edit(chat_id, message_id, bot_overview_text(), [[("🔄 بروزرسانی", "overview")], [("⬅️ منو", "menu")]]); return
+        if data.startswith("users:"):
+            with db() as conn: rows = [dict(r) for r in conn.execute("SELECT * FROM users ORDER BY id DESC LIMIT 60").fetchall()]
+            if not rows:
+                telegram_edit(chat_id, message_id, "هنوز پروکسی ساخته نشده.", [[("➕ ساخت کاربر", "new:start")], [("⬅️ منو", "menu")]]); return
+            buttons=[]
+            for r in rows:
+                icon = "✅" if int(r.get("enabled") or 0) and is_not_expired(r.get("expire_at")) else "⛔️"
+                buttons.append([(f"{icon} {r['name']} | {fmt_gb(r.get('used_gb'))}/{fmt_gb(r.get('quota_gb'))}", f"user:{r['id']}")])
+            buttons.append([("➕ ساخت کاربر", "new:start"), ("⬅️ منو", "menu")])
+            telegram_edit(chat_id, message_id, "👥 <b>لیست پروکسی‌های ساخته شده</b>", buttons); return
+        if data.startswith("user:"):
+            uid=int(data.split(":")[1])
+            with db() as conn: r=conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            if not r: telegram_edit(chat_id, message_id, "کاربر پیدا نشد.", main_menu_buttons()); return
+            telegram_edit(chat_id, message_id, user_detail_text(r), user_detail_buttons(uid)); return
+        if data.startswith("u:"):
+            _, uid_s, action = data.split(":",2); uid=int(uid_s)
+            if action == "days": ask(chat_id, "edit:days", "چند روز از امروز تنظیم شود؟", {"uid":uid,"field":"days"}); return
+            if action == "quota": set_bot_state(chat_id, "edit:quota_unit", {"uid":uid,"field":"quota"}); telegram_send_to(chat_id, "واحد حجم را انتخاب کن:", [[("GB", f"u:{uid}:quota_gb"), ("MB", f"u:{uid}:quota_mb")], [("لغو", "cancel")]]); return
+            if action in {"quota_gb","quota_mb"}: ask(chat_id, "edit:quota", f"حجم جدید را وارد کن ({'GB' if action.endswith('gb') else 'MB'}):", {"uid":uid,"field":"quota","unit":"gb" if action.endswith("gb") else "mb"}); return
+            if action == "name": ask(chat_id, "edit:name", "اسم جدید را وارد کن:", {"uid":uid,"field":"name"}); return
+            if action == "reset": update_user_core(uid, used_gb=0); telegram_send_to(chat_id, "✅ مصرف ریست شد."); return
+            if action == "toggle":
+                with db() as conn: conn.execute("UPDATE users SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END, disabled_reason=NULL WHERE id=?", (uid,)); conn.commit()
+                render_proxy_service(); telegram_send_to(chat_id, "✅ وضعیت تغییر کرد."); return
+            if action == "delask": telegram_send_to(chat_id, "حذف این کاربر قطعی است؟", [[("بله حذف کن", f"u:{uid}:delete"), ("لغو", f"user:{uid}")]]); return
+            if action == "delete":
+                with db() as conn: conn.execute("DELETE FROM users WHERE id=?", (uid,)); conn.commit()
+                render_proxy_service(); telegram_send_to(chat_id, "🗑 حذف شد.", main_menu_buttons()); return
+        if data == "settings":
+            telegram_edit(chat_id, message_id, "⚙️ <b>تنظیمات</b>", settings_buttons()); return
+        if data == "settings:server":
+            telegram_edit(chat_id, message_id, f"🌐 <b>سرور</b>\nHost: <code>{proxy_host()}</code>\nPort: <code>{base_proxy_port()}</code>", [[("تغییر دامنه/IP", "set:host"), ("تغییر پورت", "set:port")], [("⬅️ تنظیمات", "settings")]]); return
+        if data == "settings:admin":
+            telegram_edit(chat_id, message_id, "🔐 <b>ادمین پنل</b>", [[("تغییر نام کاربری", "set:admin_user"), ("تغییر رمز", "set:admin_pass")], [("⬅️ تنظیمات", "settings")]]); return
+        if data == "settings:theme":
+            telegram_edit(chat_id, message_id, "🎨 تم سایت را انتخاب کن:", [[("Dark", "theme:dark"), ("Light", "theme:light")], [("⬅️ تنظیمات", "settings")]]); return
+        if data.startswith("theme:"):
+            th=data.split(":")[1]
+            with db() as conn: set_setting(conn,"theme",th); conn.commit()
+            telegram_send_to(chat_id, "✅ تم ذخیره شد.", settings_buttons()); return
+        if data == "settings:bot":
+            telegram_edit(chat_id, message_id, f"🤖 <b>ربات</b>\nEnabled: <code>{setting('telegram_bot_enabled','1')}</code>\nChat ID: <code>{setting('telegram_chat_id','')}</code>", [[("تغییر توکن", "set:bot_token"), ("تغییر Chat ID", "set:bot_chat")], [("فعال/غیرفعال", "bot:toggle"), ("⬅️ تنظیمات", "settings")]]); return
+        if data == "bot:toggle":
+            with db() as conn:
+                cur=setting('telegram_bot_enabled','1'); set_setting(conn,'telegram_bot_enabled','0' if cur=='1' else '1'); conn.commit()
+            telegram_send_to(chat_id, "✅ وضعیت ربات تغییر کرد.", settings_buttons()); return
+        if data == "set:host": ask(chat_id, "set_server_host", "دامنه یا IP جدید را وارد کن:"); return
+        if data == "set:port": ask(chat_id, "set_server_port", "پورت مشترک پروکسی را وارد کن:"); return
+        if data == "set:admin_user": ask(chat_id, "set_admin_user", "نام کاربری جدید پنل را وارد کن:"); return
+        if data == "set:admin_pass": ask(chat_id, "set_admin_pass", "رمز جدید پنل را وارد کن:"); return
+        if data == "set:bot_token": ask(chat_id, "set_bot_token", "توکن جدید ربات را وارد کن:"); return
+        if data == "set:bot_chat": ask(chat_id, "set_bot_chat", "Chat ID ادمین را وارد کن:"); return
+        if data == "backup":
+            data_json=json.dumps(backup_payload(), ensure_ascii=False, indent=2)
+            if len(data_json)<3500: telegram_edit(chat_id,message_id,f"📦 <b>Backup JSON</b>\n<code>{data_json}</code>", [[("⬅️ منو", "menu")]])
+            else: telegram_edit(chat_id,message_id,"📦 بکاپ آماده است ولی برای تلگرام طولانی است. از سایت Export Backup بگیر.", [[("⬅️ منو", "menu")]])
+            return
+        if data == "settings:import": ask(chat_id, "import_backup", "محتوای JSON بکاپ را همینجا paste کن:"); return
+        if data == "restart": render_proxy_service(); telegram_edit(chat_id,message_id,"✅ پروکسی ری‌استارت شد.", main_menu_buttons()); return
+    except Exception as e:
+        telegram_send_to(chat_id, f"❌ خطا: {str(e)}", main_menu_buttons())
+
+
+def handle_bot_message(message: dict) -> None:
+    chat = message.get("chat", {})
+    chat_id = str(chat.get("id", ""))
+    text = (message.get("text") or "").strip()
+    allowed = bot_allowed_chat()
+    if not chat_id or not text:
+        return
+    if allowed and chat_id != allowed:
+        telegram_send_to(chat_id, "⛔️ این ربات فقط برای ادمین پنل فعال است.")
+        return
+    if not allowed:
+        with db() as conn:
+            set_setting(conn, "telegram_chat_id", chat_id)
+            conn.commit()
+    if text in {"/start", "/help", "منو", "menu"}:
+        clear_bot_state(chat_id)
+        telegram_send_to(chat_id, main_menu_text(), main_menu_buttons())
+        return
+    if handle_bot_text_state(chat_id, text):
+        return
+    telegram_send_to(chat_id, "برای مدیریت از دکمه‌ها استفاده کن.", main_menu_buttons())
+
+def bot_poll_loop() -> None:
+    last_token = ""
+    while True:
+        try:
+            if setting("telegram_bot_enabled", "1") != "1" or not bot_token():
+                time.sleep(5); continue
+            token = bot_token()
+            if token != last_token:
+                last_token = token
+            offset = int(setting("telegram_update_offset", "0") or 0)
+            res = telegram_api("getUpdates", {"timeout": 25, "offset": offset, "allowed_updates": json.dumps(["message", "callback_query"])})
+            if res.get("ok"):
+                for upd in res.get("result", []):
+                    update_id = int(upd.get("update_id", 0))
+                    with db() as conn:
+                        set_setting(conn, "telegram_update_offset", str(update_id + 1)); conn.commit()
+                    if "message" in upd:
+                        handle_bot_message(upd["message"])
+                    if "callback_query" in upd:
+                        handle_bot_callback(upd["callback_query"])
+            else:
+                time.sleep(8)
+        except Exception:
+            time.sleep(8)
+
+
+@app.on_event("startup")
+def startup() -> None:
+    init_db()
+    threading.Thread(target=bot_poll_loop, daemon=True).start()
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(req: Request) -> str:
+    page = "panel.html" if is_authed(req) else "login.html"
+    return (STATIC_DIR / page).read_text(encoding="utf-8")
+
+
+@app.post("/api/login")
+def login(username: str = Form(...), password: str = Form(...)):
+    with db() as conn:
+        admin_user = conn.execute('SELECT v FROM settings WHERE k="admin_username"').fetchone()["v"]
+        admin_hash = conn.execute('SELECT v FROM settings WHERE k="admin_hash"').fetchone()["v"]
+    if username == admin_user and pass_hash(password) == admin_hash:
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie("delta_session", hmac.new(SECRET_KEY.encode(), b"login", hashlib.sha256).hexdigest(), httponly=True, samesite="lax")
+        return resp
+    return RedirectResponse("/?err=1", status_code=303)
+
+
+@app.post("/api/logout")
+def logout():
+    resp = RedirectResponse("/", status_code=303)
+    resp.delete_cookie("delta_session")
+    return resp
+
+
+@app.get("/api/overview")
+def overview(req: Request):
+    require(req)
+    sync_traffic()
+    disk = psutil.disk_usage("/")
+    mem = psutil.virtual_memory()
+    net = psutil.net_io_counters()
+    load1, load5, load15 = os.getloadavg()
+    online = online_by_port()
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]
+        enabled = conn.execute("SELECT COUNT(*) n FROM users WHERE enabled=1").fetchone()["n"]
+        used = conn.execute("SELECT COALESCE(SUM(used_gb),0) n FROM users").fetchone()["n"]
+        quota = conn.execute("SELECT COALESCE(SUM(quota_gb),0) n FROM users").fetchone()["n"]
+        ports = [int(r["port"]) for r in conn.execute("SELECT port FROM users WHERE port IS NOT NULL").fetchall()]
+    return {"cpu": psutil.cpu_percent(interval=0.1), "load": [load1, load5, load15], "cores": psutil.cpu_count(), "ram_percent": mem.percent, "ram_total": mem.total, "ram_used": mem.used, "disk_percent": disk.percent, "disk_total": disk.total, "disk_used": disk.used, "rx": net.bytes_recv, "tx": net.bytes_sent, "proxy_status": "shared active" if enabled else "inactive", "users_total": total, "users_enabled": enabled, "online_total": online.get(base_proxy_port(),0), "quota_total": quota, "used_total": used, "public_host": proxy_host(), "proxy_port": base_proxy_port(), "uptime_seconds": int(datetime.now().timestamp() - psutil.boot_time()), "theme": setting("theme", "dark"), "mode": "shared-port", "shared_rx_bytes": int(setting("shared_rx_bytes", "0") or 0), "shared_tx_bytes": int(setting("shared_tx_bytes", "0") or 0)}
+
+
+@app.get("/api/users")
+def users(req: Request):
+    require(req)
+    sync_traffic()
+    online = online_by_port()
+    with db() as conn:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM users ORDER BY id DESC").fetchall()]
+    for row in rows:
+        row["link"] = proxy_link(row["secret"])
+        row["expired"] = not is_not_expired(row.get("expire_at"))
+        row["days_left"] = days_left(row.get("expire_at"))
+        q = float(row.get("quota_gb") or 0)
+        u = float(row.get("used_gb") or 0)
+        row["usage_percent"] = 0 if q <= 0 else min(100, round((u / q) * 100, 1))
+        row["online"] = int(online.get(base_proxy_port(), 0)) if row.get("enabled") else 0
+        row["shared_port"] = base_proxy_port()
+        row["traffic_mode"] = "shared_approx"
+    return rows
+
+
+@app.post("/api/users")
+def add_user(req: Request, name: str = Form(...), expire_days: Optional[str] = Form(None), quota_gb: float = Form(0), note: str = Form("")):
+    require(req)
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    u = create_user_core(name, expire_days or "", quota_gb, note)
+    telegram_send(f"✅ پروکسی جدید ساخته شد\n👤 {u['name']}\n🔌 Shared Port: {u['port']}\n🔗 {u['link']}")
+    return {"ok": True, "secret": u["secret"], "port": u["port"], "link": u["link"]}
+
+
+@app.post("/api/users/{uid}/update")
+def update_user(uid: int, req: Request, name: str = Form(...), expire_days: Optional[str] = Form(None), keep_expire: int = Form(1), quota_gb: float = Form(0), used_gb: float = Form(0), note: str = Form(""), enabled: int = Form(1)):
+    require(req)
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    try:
+        update_user_core(uid, name=name, expire_days=(expire_days if not keep_expire else None), quota_gb=quota_gb, used_gb=used_gb, enabled=enabled, note=note)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"ok": True}
+
+
+@app.post("/api/users/{uid}/toggle")
+def toggle(uid: int, req: Request):
+    require(req)
+    with db() as conn:
+        conn.execute("UPDATE users SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END, disabled_reason=NULL WHERE id=?", (uid,))
+        conn.commit()
+    render_proxy_service()
+    return {"ok": True}
+
+
+@app.post("/api/users/{uid}/delete")
+def delete(uid: int, req: Request):
+    require(req)
+    with db() as conn:
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.commit()
+    render_proxy_service()
+    return {"ok": True}
+
+
+@app.get("/api/settings")
+def get_settings(req: Request):
+    require(req)
+    return {"public_host": proxy_host(), "proxy_port": base_proxy_port(), "admin_username": setting("admin_username", ADMIN_USERNAME), "panel_title": setting("panel_title", "DELTA MTProto"), "theme": setting("theme", "dark"), "telegram_bot_token": setting("telegram_bot_token", ""), "telegram_chat_id": setting("telegram_chat_id", ""), "telegram_bot_enabled": setting("telegram_bot_enabled", "1")}
+
+
+@app.post("/api/settings/server")
+def save_server(req: Request, public_host: str = Form(...), proxy_port_value: int = Form(...), theme: str = Form("dark")):
+    require(req)
+    with db() as conn:
+        set_setting(conn, "public_host", public_host.strip())
+        set_setting(conn, "proxy_port", str(proxy_port_value))
+        set_setting(conn, "theme", "light" if theme == "light" else "dark")
+        conn.commit()
+    render_proxy_service()
+    return {"ok": True}
+
+
+@app.post("/api/settings/admin")
+def save_admin(req: Request, username: str = Form(...), password: str = Form("")):
+    require(req)
+    if not username.strip():
+        raise HTTPException(status_code=400, detail="username is required")
+    with db() as conn:
+        set_setting(conn, "admin_username", username.strip())
+        if password.strip():
+            set_setting(conn, "admin_hash", pass_hash(password.strip()))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/settings/telegram")
+def save_telegram(req: Request, telegram_bot_token: str = Form(""), telegram_chat_id: str = Form(""), telegram_bot_enabled: int = Form(1)):
+    require(req)
+    with db() as conn:
+        set_setting(conn, "telegram_bot_token", telegram_bot_token.strip())
+        set_setting(conn, "telegram_chat_id", telegram_chat_id.strip())
+        set_setting(conn, "telegram_bot_enabled", "1" if int(telegram_bot_enabled) else "0")
+        conn.commit()
+    return {"ok": True}
+
+
+@app.post("/api/telegram/test")
+def telegram_test(req: Request):
+    require(req)
+    return telegram_send("✅ تست اتصال بات DELTA MTProto موفق بود.")
+
+
+@app.get("/api/backup/export")
+def export_backup(req: Request):
+    require(req)
+    data = backup_payload()
+    return Response(json.dumps(data, ensure_ascii=False, indent=2), media_type="application/json", headers={"Content-Disposition": "attachment; filename=delta-mtproto-backup-v7.json"})
+
+
+@app.post("/api/backup/import")
+async def import_backup(req: Request, backup: UploadFile = File(...)):
+    require(req)
+    raw = await backup.read()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid backup file")
+    users_data = data.get("users", [])
+    settings_data = data.get("settings", {})
+    with db() as conn:
+        for k, v in settings_data.items():
+            if k in {"public_host", "proxy_port", "panel_title", "admin_username", "admin_hash", "theme", "telegram_bot_token", "telegram_chat_id", "telegram_bot_enabled"}:
+                set_setting(conn, k, str(v))
+        conn.execute("DELETE FROM users")
+        for u in users_data:
+            conn.execute("INSERT INTO users(name, secret, enabled, expire_at, quota_gb, used_gb, port, rx_bytes, tx_bytes, last_seen, disabled_reason, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (u.get("name", "user"), u.get("secret") or secrets.token_hex(16), int(u.get("enabled", 1)), u.get("expire_at"), float(u.get("quota_gb") or 0), float(u.get("used_gb") or 0), int(u.get("port") or next_free_port(conn, base_proxy_port())), int(u.get("rx_bytes") or 0), int(u.get("tx_bytes") or 0), u.get("last_seen"), u.get("disabled_reason"), u.get("note", ""), u.get("created_at") or now_iso()))
+        conn.commit()
+    render_proxy_service()
+    return {"ok": True, "imported": len(users_data)}
+
+
+@app.post("/api/proxy/restart")
+def restart(req: Request):
+    require(req)
+    render_proxy_service()
+    return {"ok": True}
+
+
+@app.get("/api/proxy/logs")
+def logs(req: Request):
+    require(req)
+    proc = subprocess.run(["journalctl", "-u", "mtpulse-shared", "-n", "220", "--no-pager"], text=True, capture_output=True, check=False)
+    return JSONResponse({"logs": proc.stdout[-24000:]})
