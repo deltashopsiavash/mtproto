@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DELTA MTProto Panel</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span>Δ</span><div><b>DELTA</b><small>MTProto Control</small></div></div>
+    <button class="nav active" data-page="overview">داشبورد</button>
+    <button class="nav" data-page="users">کاربران</button>
+    <button class="nav" data-page="settings">تنظیمات</button>
+    <button class="nav" data-page="logs">لاگ‌ها</button>
+    <form method="post" action="/api/logout"><button class="logout">خروج</button></form>
+  </aside>
+
+  <main class="main">
+    <section id="overview" class="page active">
+      <div class="hero">
+        <div><p class="eyebrow">Live Overview</p><h1>کنترل‌سنتر پروکسی‌ها</h1><p>همه کاربران روی یک پورت مشترک، secret اختصاصی، آنلاین‌های لحظه‌ای و وضعیت کامل سرور.</p></div>
+        <div class="hero-actions"><button class="primary" onclick="restartProxy()">ری‌استارت سرویس‌ها</button><button onclick="loadOverview()">رفرش</button></div>
+      </div>
+      <div id="cards" class="cards"></div>
+    </section>
+
+    <section id="users" class="page">
+      <div class="hero slim"><div><p class="eyebrow">User Manager</p><h1>کاربران و پروکسی‌ها</h1><p>بعد از ساخت هم حجم، تاریخ و وضعیت هر کاربر قابل تغییر است؛ همه کاربران روی یک پورت مشترک هستند.</p></div></div>
+      <div class="layout">
+        <form id="userForm" class="panel-card form-card">
+          <h2>ساخت کاربر جدید</h2>
+          <label>نام کاربر</label><input name="name" placeholder="مثلاً Ali" required />
+          <div class="row"><div><label>مدت اعتبار / روز</label><input name="expire_days" type="number" min="0" step="1" placeholder="30" /></div><div><label>حجم / گیگابایت</label><input name="quota_gb" type="number" min="0" step="0.1" value="0" /></div></div>
+          <label>یادداشت</label><textarea name="note" rows="3" placeholder="اختیاری"></textarea>
+          <button class="primary full" type="submit">ساخت پروکسی</button>
+          <p class="muted">حالت v4 Shared Port است: همه کاربران روی یک پورت‌اند. مصرف دقیق هر secret نیاز به MTProxy لاگ‌دار دارد؛ فعلاً مصرف کاربر قابل ثبت/ویرایش و ترافیک کل پورت قابل مشاهده است.</p>
+        </form>
+        <div class="panel-card"><div class="section-head"><h2>لیست کاربران</h2><input id="searchUser" placeholder="جستجو..." /></div><div id="userList" class="user-list"></div></div>
+      </div>
+    </section>
+
+    <section id="settings" class="page">
+      <div class="hero slim"><div><p class="eyebrow">Settings</p><h1>تنظیمات پنل</h1><p>ظاهر پنل، ورود، آدرس لینک‌ها، بکاپ و API بات تلگرام.</p></div></div>
+      <div class="settings-grid">
+        <form id="serverForm" class="panel-card"><h2>سرور و ظاهر</h2><label>دامنه یا IP نمایشی</label><input name="public_host" placeholder="example.com یا 1.2.3.4" /><label>پورت مشترک همه پروکسی‌ها</label><input name="proxy_port_value" type="number" min="1" max="65535" /><label>تم پنل</label><select name="theme"><option value="dark">دارک حرفه‌ای</option><option value="light">لایت حرفه‌ای</option></select><button class="primary">ذخیره</button></form>
+        <form id="adminForm" class="panel-card"><h2>ورود به پنل</h2><label>نام کاربری</label><input name="username" required /><label>رمز جدید</label><input name="password" type="password" placeholder="خالی بماند یعنی تغییر نکند" /><button class="primary">ذخیره ورود</button></form>
+        <form id="telegramForm" class="panel-card"><h2>API بات تلگرام</h2><label>Bot Token</label><input name="telegram_bot_token" dir="ltr" placeholder="123456:ABC..." /><label>Chat ID</label><input name="telegram_chat_id" dir="ltr" placeholder="مثلاً 123456789" /><button class="primary">ذخیره بات</button><button type="button" class="ghost" onclick="testTelegram()">ارسال پیام تست</button><p class="muted">فعلاً ساخت کاربر جدید و تست اتصال پیام تلگرام می‌فرستد.</p></form>
+        <div class="panel-card backup-card"><h2>بکاپ</h2><p class="muted">بکاپ شامل تمام کاربران، Secretها، پورت‌ها، حجم، تاریخ، تنظیمات و بات است.</p><a class="button primary" href="/api/backup/export">دانلود بکاپ</a><form id="importForm"><label>ایمپورت بکاپ</label><input name="backup" type="file" accept="application/json,.json" required /><button class="ghost">ایمپورت و جایگزینی</button></form></div>
+      </div>
+    </section>
+
+    <section id="logs" class="page">
+      <div class="hero slim"><div><p class="eyebrow">Logs</p><h1>لاگ‌های سرویس</h1></div><button onclick="loadLogs()">رفرش</button></div>
+      <pre id="logBox" class="logs"></pre>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
