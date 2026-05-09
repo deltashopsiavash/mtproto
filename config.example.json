@@ -1,0 +1,14 @@
+{
+  "panel_host": "0.0.0.0",
+  "panel_port": 8080,
+  "sub_port": 8081,
+  "admin_username": "admin",
+  "admin_password_hash": "CHANGE_ME",
+  "proxy_ports": "443,8443,9443",
+  "repo_url": "https://github.com/deltashopsiavash/mtproto.git",
+  "public_ip": "1.2.3.4",
+  "server_host": "example.com",
+  "theme": "dark",
+  "api_token": "CHANGE_ME",
+  "telegram_bot_token": ""
+}
