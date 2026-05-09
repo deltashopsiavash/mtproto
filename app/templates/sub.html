@@ -1,0 +1,10 @@
+<!doctype html><html lang="fa" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{name}}</title><link rel="stylesheet" href="/static/sub.css"></head>
+<body><div class="bg"><span></span><span></span><span></span><span></span></div>
+<main class="sub-card"><h1>{{name}}</h1><p>وضعیت: {{active}}</p>
+<div class="grid"><div><b>{{remaining}}</b><small>حجم مانده</small></div><div><b>{{used}}</b><small>مصرف شده</small></div><div><b>{{days_left}}</b><small>روز مانده</small></div></div>
+<textarea id="link" readonly>{{link}}</textarea><button onclick="copyLink()">کپی لینک پروکسی</button>
+<div class="colors"><i onclick="setBg('blue')"></i><i onclick="setBg('yellow')"></i><i onclick="setBg('green')"></i></div></main>
+<script>function copyLink(){navigator.clipboard.writeText(document.getElementById('link').value).then(()=>alert('کپی شد'))}
+function setBg(c){document.body.className=c}</script></body></html>
