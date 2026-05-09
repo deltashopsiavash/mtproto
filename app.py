@@ -30,6 +30,30 @@ def public_host(): return cfg().get('server_host') or cfg().get('public_ip') or 
 def quota_bytes(r):
     try: return int(r['quota_bytes'] or 0)
     except Exception: return int(float(r['quota_gb'] or 0)*1024**3)
+
+def normalize_secret(secret):
+    secret=(secret or '').strip().lower()
+    if not secret:
+        return secrets.token_hex(16)
+    # Telegram MTProxy secret must normally be 32 hex chars. Keep dd/ee style advanced secrets if valid hex.
+    if len(secret) in (32,34,66) and all(c in '0123456789abcdef' for c in secret):
+        return secret
+    raise ValueError('Secret نامعتبر است. Secret باید hex باشد، مثلا 32 کاراکتر 0-9 و a-f.')
+
+def parse_quota_form(form):
+    unit=(form.get('quota_unit') or 'gb').lower().strip()
+    amount=float(form.get('quota_amount') or 0)
+    if amount <= 0:
+        return 0, 0.0, unit
+    mult=1024**2 if unit=='mb' else 1024**3
+    qb=int(round(amount*mult))
+    return qb, qb/1024**3, unit
+
+def quota_edit_value(qb):
+    qb=int(qb or 0)
+    if qb and qb < 1024**3:
+        return round(qb/1024**2,3), 'mb'
+    return (round(qb/1024**3,3) if qb else 0), 'gb'
 def proxy_link(r): return f"tg://proxy?server={public_host()}&port={shared_proxy_port()}&secret={r['secret']}"
 def sub_link(r):
     c=cfg(); return f"http://{public_host()}:{int(c.get('sub_port') or c.get('panel_port',8080))}/s/{r['sub_token']}"
@@ -86,13 +110,25 @@ def init_db():
         for r in con.execute('select id from users where sub_token is null or sub_token=""').fetchall(): con.execute('update users set sub_token=? where id=?',(secrets.token_urlsafe(16),r['id']))
 
 def q(x): return "'"+str(x).replace("'","'\\''")+"'"
+def cleanup_old_proxy_services():
+    sh("systemctl list-units 'mtproxy-user-*' --all --no-legend 2>/dev/null | awk '{print $1}' | xargs -r systemctl disable --now >/dev/null 2>&1 || true")
+
 def restart_shared_proxy():
     port=shared_proxy_port(); ensure_traffic_rule(port); MTPROXY_DIR.mkdir(parents=True,exist_ok=True)
+    cleanup_old_proxy_services()
     with db() as con: rows=con.execute('select secret from users where enabled=1').fetchall()
     args=' '.join('-S '+q(r['secret']) for r in rows if r['secret'])
-    if not args: sh('systemctl disable --now mtproxy-shared.service >/dev/null 2>&1 || true'); return
-    unit=f"""[Unit]\nDescription=Shared MTProto Proxy Multi Secret\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/mtproto-proxy -u nobody -p 9000 -H {port} {args} --aes-pwd {MTPROXY_DIR}/proxy-secret {MTPROXY_DIR}/proxy-multi.conf -M 1\nRestart=always\nRestartSec=3\nLimitNOFILE=65535\n\n[Install]\nWantedBy=multi-user.target\n"""
-    path=Path('/etc/systemd/system/mtproxy-shared.service'); path.write_text(unit); sh('systemctl daemon-reload'); sh('systemctl enable --now mtproxy-shared.service'); sh('systemctl restart mtproxy-shared.service')
+    # stop first so deleted/disabled secrets cannot stay alive in an old process
+    sh('systemctl stop mtproxy-shared.service >/dev/null 2>&1 || true')
+    sh("pkill -f '/usr/local/bin/mtproto-proxy.*-H %s' >/dev/null 2>&1 || true" % port)
+    if not args:
+        sh('systemctl disable mtproxy-shared.service >/dev/null 2>&1 || true')
+        return
+    unit=f"""[Unit]\nDescription=Shared MTProto Proxy Multi Secret\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/mtproto-proxy -u nobody -p 9000 -H {port} {args} --aes-pwd {MTPROXY_DIR}/proxy-secret {MTPROXY_DIR}/proxy-multi.conf -M 1\nRestart=always\nRestartSec=3\nLimitNOFILE=65535\nKillMode=control-group\nTimeoutStopSec=5\n\n[Install]\nWantedBy=multi-user.target\n"""
+    path=Path('/etc/systemd/system/mtproxy-shared.service'); path.write_text(unit)
+    sh('systemctl daemon-reload')
+    sh('systemctl enable mtproxy-shared.service >/dev/null 2>&1 || true')
+    sh('systemctl restart mtproxy-shared.service')
 def create_service(r=None): restart_shared_proxy()
 def stop_service(u=None): restart_shared_proxy()
 
@@ -123,7 +159,7 @@ CSS=r'''
 .sub-page{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;position:relative;overflow:hidden;font-family:Tahoma,Arial,sans-serif}.sub-page .particle{position:absolute;top:-10%;font-size:20px;opacity:.68;animation:fall linear infinite;pointer-events:none}.sub-page .bird{animation:fly linear infinite}.sub-page .wind{animation:drift linear infinite}.sub-page .rain{position:absolute;top:-10%;width:2px;height:24px;background:#dbeafe;border-radius:99px;opacity:.58;animation:fall linear infinite}.sub-page .sand{position:absolute;width:7px;height:7px;border-radius:50%;background:#fde68a;opacity:.55;animation:drift linear infinite}@keyframes fall{to{transform:translateY(120vh) rotate(360deg)}}@keyframes fly{to{transform:translateX(120vw) translateY(-24vh)}}@keyframes drift{to{transform:translateX(80vw) translateY(-20vh) rotate(220deg)}}@keyframes bgMove{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}.theme-rain{background:linear-gradient(135deg,#0b1220,#164e63,#1e293b)}.theme-flower{background:linear-gradient(135deg,#fff1f2,#fbcfe8,#fb7185)}.theme-bird{background:linear-gradient(135deg,#ecfeff,#bae6fd,#38bdf8)}.theme-heart{background:linear-gradient(135deg,#4c0519,#be123c,#fb7185)}.theme-desert{background:linear-gradient(135deg,#7c2d12,#f59e0b,#fde68a)}.theme-aurora{background:linear-gradient(120deg,#020617,#0f766e,#7c3aed,#020617);background-size:300% 300%;animation:bgMove 10s ease infinite}.theme-snow{background:linear-gradient(135deg,#e0f2fe,#f8fafc,#bae6fd)}.theme-star{background:radial-gradient(circle at 30% 20%,#fef3c7,transparent 18%),linear-gradient(135deg,#111827,#312e81,#020617)}.sub-card{width:min(470px,100%);background:rgba(255,255,255,.84);backdrop-filter:blur(18px);color:#182b2f;border-radius:22px;padding:16px;box-shadow:0 18px 48px rgba(0,0,0,.22);direction:rtl;position:relative;z-index:2}.sub-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.avatar{width:50px;height:50px;border-radius:50%;background:linear-gradient(135deg,#bfdbfe,#60a5fa);border:3px solid rgba(255,255,255,.8)}.sub-name{font-size:20px;font-weight:900}.sub-box{margin-top:13px;background:rgba(255,255,255,.72);border:1px solid rgba(255,255,255,.5);border-radius:19px;padding:14px;text-align:center}.sub-title{font-size:18px;font-weight:900;margin-bottom:10px}.sub-stats{display:grid;grid-template-columns:1fr 1fr;gap:10px}.sub-num{font-size:23px;font-weight:900}.battery{height:25px;border-radius:9px;background:#263238;padding:4px;margin:8px auto 0;max-width:92px}.battery span{display:block;height:100%;border-radius:7px;background:#65a30d}.percent{font-size:11px;color:#475569;margin-top:5px}.sub-link{margin-top:12px;background:#172033;color:white;border-radius:14px;padding:10px;direction:ltr;word-break:break-all;font-family:monospace;font-size:10px}.theme-dots{position:fixed;bottom:14px;left:0;right:0;display:flex;gap:10px;justify-content:center;z-index:4}.theme-dot{width:22px;height:22px;border-radius:50%;border:2px solid #fff;box-shadow:0 5px 18px #0005;cursor:pointer}.theme-dot:nth-child(1){background:linear-gradient(135deg,#0f172a,#38bdf8)}.theme-dot:nth-child(2){background:linear-gradient(135deg,#fdf2f8,#fb7185)}.theme-dot:nth-child(3){background:linear-gradient(135deg,#dbeafe,#2563eb)}.theme-dot:nth-child(4){background:linear-gradient(135deg,#4c0519,#fb7185)}.theme-dot:nth-child(5){background:linear-gradient(135deg,#78350f,#fde68a)}.theme-dot:nth-child(6){background:linear-gradient(135deg,#0f766e,#7c3aed)}.theme-dot:nth-child(7){background:linear-gradient(135deg,#f8fafc,#38bdf8)}.theme-dot:nth-child(8){background:linear-gradient(135deg,#111827,#fef3c7)}
 @media(max-width:700px){.wrap{padding:11px}.brand{font-size:18px}.menu a,.btn{padding:8px 10px;font-size:13px}.grid{grid-template-columns:1fr}.card{border-radius:17px;padding:13px}td,th{padding:8px;font-size:12px}.copy-row{flex-direction:column;align-items:stretch}.copy-row code{white-space:normal}.table-wrap table{min-width:860px}.sub-card{padding:13px;border-radius:18px}.avatar{width:44px;height:44px}.sub-name{font-size:18px}.sub-box{padding:12px}.sub-title{font-size:17px}.sub-stats{grid-template-columns:1fr}.sub-num{font-size:21px}.sub-link{font-size:10px}.theme-dots{bottom:8px;gap:7px}.theme-dot{width:20px;height:20px}}
 '''
-BASE='''<!doctype html><html lang="fa"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MTProto Panel</title><style>{{css}}</style><script>function copyText(t,b){const done=()=>{let o=b.innerText;b.innerText='کپی شد ✓';setTimeout(()=>b.innerText=o,1200)}; if(navigator.clipboard){navigator.clipboard.writeText(t).then(done).catch(()=>fallbackCopy(t,done))}else fallbackCopy(t,done)}function fallbackCopy(t,cb){let x=document.createElement('textarea');x.value=t;document.body.appendChild(x);x.select();document.execCommand('copy');x.remove();cb&&cb()}</script></head><body class="theme-{{theme}}"><div class="wrap"><div class="nav"><div class="brand">⚡ MTProto Panel</div>{% if session.get('auth') %}<div class="menu"><a href="/">Overview</a><a href="/users">کاربران</a><a href="/settings">تنظیمات</a><a href="/logout">خروج</a></div>{% endif %}</div>{% for m in get_flashed_messages() %}<div class="flash">{{m}}</div>{% endfor %}{{body|safe}}</div></body></html>'''
+BASE='''<!doctype html><html lang="fa"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MTProto Panel</title><style>{{css}}</style><script>function copyText(t,b){const done=()=>{let o=b.innerText;b.innerText='کپی شد ✓';setTimeout(()=>b.innerText=o,1200)}; if(navigator.clipboard){navigator.clipboard.writeText(t).then(done).catch(()=>fallbackCopy(t,done))}else fallbackCopy(t,done)}function fallbackCopy(t,cb){let x=document.createElement('textarea');x.value=t;document.body.appendChild(x);x.select();document.execCommand('copy');x.remove();cb&&cb()}</script></head><body class="theme-{{theme}}"><div class="wrap"><div class="nav"><div class="brand">⚡ MTProto Panel</div>{% if session.get('auth') %}<div class="menu"><a href="/">Overview</a><a href="/users">کاربران</a><a href="/settings">تنظیمات</a><a href="/apply-restart" onclick="return confirm('تغییرات روی پروکسی اعمال شود؟')">🔄 اعمال تغییرات</a><a href="/logout">خروج</a></div>{% endif %}</div>{% for m in get_flashed_messages() %}<div class="flash">{{m}}</div>{% endfor %}{{body|safe}}</div></body></html>'''
 def page(body): return render_template_string(BASE,body=body,css=CSS,theme=cfg().get('theme','dark'))
 
 @app.route('/login',methods=['GET','POST'])
@@ -140,13 +176,21 @@ def logout(): session.clear(); return redirect('/login')
 def overview():
     vm=psutil.virtual_memory(); du=psutil.disk_usage('/'); cpu=psutil.cpu_percent(interval=.2)
     with db() as con: rows=con.execute('select * from users').fetchall(); total=len(rows); active=sum(1 for r in rows if r['enabled'])
-    body=render_template_string('''<h2>Overview</h2><div class="grid"><div class="card"><div class="muted">CPU</div><div class="big">{{cpu}}%</div><div class="bar"><span style="width:{{cpu}}%"></span></div></div><div class="card"><div class="muted">RAM</div><div class="big">{{ram}}%</div><div class="muted">{{ru}} / {{rt}} GB</div></div><div class="card"><div class="muted">آنلاین‌های لحظه‌ای</div><div class="big ok">{{online}}</div></div><div class="card"><div class="muted">Users</div><div class="big">{{active}} / {{total}}</div></div><div class="card"><div class="muted">پورت مشترک پروکسی</div><div class="big">{{sport}}</div></div><div class="card"><div class="muted">Server Host</div><div class="big" style="font-size:18px">{{host}}</div></div></div>''',cpu=cpu,ram=vm.percent,ru=round(vm.used/1024**3,2),rt=round(vm.total/1024**3,2),online=online_count(shared_proxy_port()),active=active,total=total,sport=shared_proxy_port(),host=public_host())
+    body=render_template_string('''<h2>Overview</h2><div class="grid"><div class="card"><div class="muted">CPU</div><div class="big">{{cpu}}%</div><div class="bar"><span style="width:{{cpu}}%"></span></div></div><div class="card"><div class="muted">RAM</div><div class="big">{{ram}}%</div><div class="muted">{{ru}} / {{rt}} GB</div></div><div class="card"><div class="muted">آنلاین‌های لحظه‌ای</div><div class="big ok">{{online}}</div></div><div class="card"><div class="muted">Users</div><div class="big">{{active}} / {{total}}</div></div><div class="card"><div class="muted">پورت مشترک پروکسی</div><div class="big">{{sport}}</div></div><div class="card"><div class="muted">Server Host</div><div class="big" style="font-size:18px">{{host}}</div></div><div class="card"><div class="muted">اعمال تغییرات</div><div class="big" style="font-size:18px"><a class="btn" href="/apply-restart" onclick="return confirm('سرویس پروکسی ریستارت و تنظیمات اعمال شود؟')">🔄 Restart / Apply</a></div></div></div>''',cpu=cpu,ram=vm.percent,ru=round(vm.used/1024**3,2),rt=round(vm.total/1024**3,2),online=online_count(shared_proxy_port()),active=active,total=total,sport=shared_proxy_port(),host=public_host())
     return page(body)
+
+@app.route('/apply-restart')
+@login_required
+def apply_restart():
+    restart_shared_proxy()
+    flash('تغییرات اعمال شد و سرویس پروکسی ریستارت شد.')
+    return redirect(request.referrer or '/users')
+
 @app.route('/users')
 @login_required
 def users():
     with db() as con: rows=con.execute('select * from users order by id desc').fetchall()
-    body='<div class="actions"><a class="btn" href="/users/new">+ ساخت کاربر جدید</a></div><br><div class="table-wrap"><table><tr><th>کاربر</th><th>پورت مشترک</th><th>آنلاین</th><th>حجم</th><th>مصرف واقعی</th><th>انقضا</th><th>وضعیت</th><th>لینک‌ها</th><th>عملیات</th></tr>'
+    body="""<div class='actions'><a class='btn' href='/users/new'>+ ساخت کاربر جدید</a><a class='btn' href='/apply-restart' onclick=\"return confirm('تغییرات اعمال شود؟')\">🔄 اعمال تغییرات / ریستارت</a></div><br><div class='table-wrap'><table><tr><th>کاربر</th><th>پورت مشترک</th><th>آنلاین</th><th>حجم</th><th>مصرف واقعی</th><th>انقضا</th><th>وضعیت</th><th>لینک‌ها</th><th>عملیات</th></tr>"""
     for r in rows:
         pl=proxy_link(r); sl=sub_link(r); qb=quota_bytes(r); status='<span class="ok">فعال</span>' if r['enabled'] else '<span class="bad">غیرفعال</span>'; toggle='🚫' if r['enabled'] else '✅'
         links=f"<div class='copy-row'><code>{pl}</code><button type='button' class='btn copy-btn' onclick='copyText({js(pl)},this)'>کپی پروکسی</button></div><div class='copy-row'><code>{sl}</code><button type='button' class='btn copy-btn' onclick='copyText({js(sl)},this)'>کپی ساب</button></div>"
@@ -158,7 +202,7 @@ def new_user():
     port=shared_proxy_port()
     if request.method=='POST':
         try:
-            username=request.form['username'].strip(); unit=request.form.get('quota_unit','gb'); qv=float(request.form.get('quota_amount') or 0); qb=int(qv*(1024**2 if unit=='mb' else 1024**3)) if qv>0 else 0; qgb=qb/1024**3 if qb else 0; days=int(request.form.get('expiry_days') or 30); expires=(date.today()+timedelta(days=days)).isoformat(); manual=(request.form.get('secret') or '').strip(); secret=manual if request.form.get('secret_mode')=='manual' and manual else secrets.token_hex(16)
+            username=request.form['username'].strip(); qb,qgb,unit=parse_quota_form(request.form); days=int(request.form.get('expiry_days') or 30); expires=(date.today()+timedelta(days=days)).isoformat(); manual=(request.form.get('secret') or '').strip(); secret=normalize_secret(manual if request.form.get('secret_mode')=='manual' else '')
             with db() as con:
                 con.execute('insert into users(username,port,secret,quota_gb,quota_bytes,expires_at,enabled,created_at,note,sub_token,used_reset_bytes) values(?,?,?,?,?,?,?,?,?,?,?)',(username,port,secret,qgb,qb,expires,1,datetime.utcnow().isoformat(),request.form.get('note',''),secrets.token_urlsafe(16),used_bytes_raw(port)))
             restart_shared_proxy(); flash('کاربر ساخته شد و Secret روی پورت مشترک فعال شد.'); return redirect('/users')
@@ -170,11 +214,11 @@ def edit_user(uid):
     with db() as con: r=con.execute('select * from users where id=?',(uid,)).fetchone()
     if not r: return redirect('/users')
     if request.method=='POST':
-        unit=request.form.get('quota_unit','gb'); qv=float(request.form.get('quota_amount') or 0); qb=int(qv*(1024**2 if unit=='mb' else 1024**3)) if qv>0 else 0; qgb=qb/1024**3 if qb else 0; days=int(request.form.get('expiry_days') or 30); expires=(date.today()+timedelta(days=days)).isoformat(); enabled=1 if request.form.get('enabled')=='on' else 0; reset=used_bytes_raw(shared_proxy_port()) if request.form.get('reset_usage')=='on' else r['used_reset_bytes']; secret=(request.form.get('secret') or r['secret']).strip()
+        qb,qgb,unit=parse_quota_form(request.form); days=int(request.form.get('expiry_days') or 30); expires=(date.today()+timedelta(days=days)).isoformat(); enabled=1 if request.form.get('enabled')=='on' else 0; reset=used_bytes_raw(shared_proxy_port()) if request.form.get('reset_usage')=='on' else r['used_reset_bytes']; secret=normalize_secret(request.form.get('secret') or r['secret'])
         with db() as con: con.execute('update users set port=?,secret=?,quota_gb=?,quota_bytes=?,expires_at=?,note=?,enabled=?,used_reset_bytes=? where id=?',(shared_proxy_port(),secret,qgb,qb,expires,request.form.get('note',''),enabled,reset,uid))
         restart_shared_proxy(); flash('اطلاعات کاربر بروزرسانی شد.'); return redirect('/users')
-    cur=round(quota_bytes(r)/1024**3,3) if quota_bytes(r) else 0
-    return page(render_template_string('''<div class="card"><h2>ویرایش {{r['username']}}</h2><form method="post"><label>Secret<input name="secret" value="{{r['secret']}}"></label><div class="grid"><label>حجم<input name="quota_amount" type="number" step="0.001" value="{{cur}}"></label><label>واحد حجم<select name="quota_unit"><option value="gb">GB</option><option value="mb">MB</option></select></label></div><label>اعتبار از امروز به روز<input name="expiry_days" type="number" min="1" value="30"></label><div class="muted">انقضای فعلی: {{r['expires_at']}}</div><label>یادداشت<input name="note" value="{{r['note'] or ''}}"></label><label><input style="width:auto" type="checkbox" name="reset_usage"> صفر کردن مصرف</label><label><input style="width:auto" type="checkbox" name="enabled" {% if r['enabled'] %}checked{% endif %}> فعال باشد</label><button class="btn">ذخیره</button></form></div>''',r=r,cur=cur))
+    cur,cur_unit=quota_edit_value(quota_bytes(r))
+    return page(render_template_string('''<div class="card"><h2>ویرایش {{r['username']}}</h2><form method="post"><label>Secret<input name="secret" value="{{r['secret']}}"></label><div class="grid"><label>حجم<input name="quota_amount" type="number" step="0.001" value="{{cur}}"></label><label>واحد حجم<select name="quota_unit"><option value="gb" {% if cur_unit=='gb' %}selected{% endif %}>GB</option><option value="mb" {% if cur_unit=='mb' %}selected{% endif %}>MB</option></select></label></div><label>اعتبار از امروز به روز<input name="expiry_days" type="number" min="1" value="30"></label><div class="muted">انقضای فعلی: {{r['expires_at']}}</div><label>یادداشت<input name="note" value="{{r['note'] or ''}}"></label><label><input style="width:auto" type="checkbox" name="reset_usage"> صفر کردن مصرف</label><label><input style="width:auto" type="checkbox" name="enabled" {% if r['enabled'] %}checked{% endif %}> فعال باشد</label><button class="btn">ذخیره</button></form></div>''',r=r,cur=cur,cur_unit=cur_unit))
 @app.route('/users/<int:uid>/toggle')
 @login_required
 def toggle(uid):
@@ -186,7 +230,7 @@ def toggle(uid):
 @login_required
 def delete(uid):
     with db() as con: con.execute('delete from users where id=?',(uid,))
-    restart_shared_proxy(); return redirect('/users')
+    restart_shared_proxy(); flash('کاربر حذف شد. برای اطمینان، سرویس پروکسی هم ریستارت شد.') ; return redirect('/users')
 @app.route('/settings',methods=['GET','POST'])
 @login_required
 def settings():
@@ -202,7 +246,7 @@ def settings():
             save_cfg(c); restart_shared_proxy(); flash('تنظیمات ذخیره شد.'); return redirect('/settings')
         elif a=='api': c['api_token']=request.form.get('api_token','').strip() or secrets.token_urlsafe(24); c['telegram_bot_token']=request.form.get('telegram_bot_token','').strip()
         save_cfg(c); flash('ذخیره شد.'); return redirect('/settings')
-    body=render_template_string('''<h2>تنظیمات</h2><div class="grid"><div class="card"><h3>ورود پنل</h3><form method="post"><input type="hidden" name="action" value="account"><label>نام کاربری<input name="admin_username" value="{{c.get('admin_username','')}}"></label><label>رمز جدید<input name="admin_password" type="password"></label><button class="btn">ذخیره</button></form></div><div class="card"><h3>سرور</h3><form method="post"><input type="hidden" name="action" value="server"><label>دامنه/IP لینک‌ها<input name="server_host" value="{{host}}"></label><label>پورت مشترک پروکسی‌ها<input name="shared_proxy_port" type="number" value="{{sport}}"></label><label>پورت ساب<input name="sub_port" type="number" value="{{c.get('sub_port',c.get('panel_port',8080))}}"></label><label>تم پنل<select name="theme"><option value="dark" {% if c.get('theme','dark')=='dark' %}selected{% endif %}>Dark</option><option value="light" {% if c.get('theme')=='light' %}selected{% endif %}>Light</option></select></label><button class="btn">ذخیره</button></form></div><div class="card"><h3>API تلگرام بات</h3><form method="post"><input type="hidden" name="action" value="api"><label>Bot Token<input name="telegram_bot_token" value="{{c.get('telegram_bot_token','')}}"></label><label>API Token<input name="api_token" value="{{c.get('api_token','')}}"></label><button class="btn">ذخیره</button></form></div><div class="card"><h3>Backup</h3><a class="btn" href="/settings/backup/export">دانلود بکاپ</a><hr><form method="post" action="/settings/backup/import" enctype="multipart/form-data"><label>Import JSON<input type="file" name="backup" accept="application/json" required></label><button class="btn danger">ایمپورت</button></form></div></div>''',c=c,host=public_host(),sport=shared_proxy_port())
+    body=render_template_string('''<h2>تنظیمات</h2><div class="grid"><div class="card"><h3>ورود پنل</h3><form method="post"><input type="hidden" name="action" value="account"><label>نام کاربری<input name="admin_username" value="{{c.get('admin_username','')}}"></label><label>رمز جدید<input name="admin_password" type="password"></label><button class="btn">ذخیره</button></form></div><div class="card"><h3>سرور</h3><form method="post"><input type="hidden" name="action" value="server"><label>دامنه/IP لینک‌ها<input name="server_host" value="{{host}}"></label><label>پورت مشترک پروکسی‌ها<input name="shared_proxy_port" type="number" value="{{sport}}"></label><label>پورت ساب<input name="sub_port" type="number" value="{{c.get('sub_port',c.get('panel_port',8080))}}"></label><label>تم پنل<select name="theme"><option value="dark" {% if c.get('theme','dark')=='dark' %}selected{% endif %}>Dark</option><option value="light" {% if c.get('theme')=='light' %}selected{% endif %}>Light</option></select></label><button class="btn">ذخیره</button></form></div><div class="card"><h3>API تلگرام بات</h3><form method="post"><input type="hidden" name="action" value="api"><label>Bot Token<input name="telegram_bot_token" value="{{c.get('telegram_bot_token','')}}"></label><label>API Token<input name="api_token" value="{{c.get('api_token','')}}"></label><button class="btn">ذخیره</button></form></div><div class="card"><h3>اعمال تغییرات</h3><p class="muted">بعد از حذف، تغییر Secret، تغییر پورت یا هر تغییر مهم، این دکمه سرویس پروکسی را کامل ریستارت می‌کند تا کاربر حذف‌شده واقعاً قطع شود.</p><a class="btn" href="/apply-restart" onclick="return confirm('سرویس پروکسی ریستارت شود؟')">🔄 Restart / Apply</a></div><div class="card"><h3>Backup</h3><a class="btn" href="/settings/backup/export">دانلود بکاپ</a><hr><form method="post" action="/settings/backup/import" enctype="multipart/form-data"><label>Import JSON<input type="file" name="backup" accept="application/json" required></label><button class="btn danger">ایمپورت</button></form></div></div>''',c=c,host=public_host(),sport=shared_proxy_port())
     return page(body)
 @app.route('/settings/backup/export')
 @login_required

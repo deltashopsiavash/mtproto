@@ -29,7 +29,8 @@ rm -rf "$APP_DIR.new"
 "$APP_DIR/venv/bin/python" -c "import sys; sys.path.insert(0,'$APP_DIR'); import app; app.init_db()"
 systemctl daemon-reload
 systemctl restart mtproto-panel.service
-systemctl list-units 'mtproxy-user-*' --no-legend 2>/dev/null | awk '{print $1}' | xargs -r systemctl restart || true
+systemctl list-units 'mtproxy-user-*' --all --no-legend 2>/dev/null | awk '{print $1}' | xargs -r systemctl disable --now >/dev/null 2>&1 || true
+"$APP_DIR/venv/bin/python" -c "import sys; sys.path.insert(0,'$APP_DIR'); import app; app.restart_shared_proxy()" || true
 cat > /usr/local/bin/mtp-update <<'EOF'
 #!/usr/bin/env bash
 bash <(curl -Ls https://raw.githubusercontent.com/deltashopsiavash/mtproto/main/update.sh)
