@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DELTA MTProto Panel - Login</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand">DELTA</div>
+    <h1>ورود به پنل MTProto</h1>
+    <p>برای مدیریت کاربران و پروکسی‌ها وارد شوید.</p>
+    <form method="post" action="/api/login">
+      <label>یوزرنیم</label>
+      <input name="username" autocomplete="username" required />
+      <label>پسورد</label>
+      <input name="password" type="password" autocomplete="current-password" required />
+      <button type="submit">ورود</button>
+    </form>
+    <div id="err" class="error" hidden>نام کاربری یا پسورد اشتباه است.</div>
+  </main>
+  <script>
+    if (new URLSearchParams(location.search).get('err')) document.getElementById('err').hidden = false;
+  </script>
+</body>
+</html>
